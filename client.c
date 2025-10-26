@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200112L
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -9,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-client-protocol.h"
 
 enum pointer_event_mask {
@@ -57,6 +59,9 @@ struct client_state {
 	int width, height;
 	bool closed;
 	struct pointer_event pointer_event;
+	struct xkb_state *xkb_state;
+	struct xkb_context *xkb_context;
+	struct xkb_keymap *xkb_keymap;
 };
 
 static void
@@ -350,10 +355,103 @@ static const struct wl_pointer_listener wl_pointer_listener = {
 };
 
 static void
+wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
+		   uint32_t format, int32_t fd, uint32_t size) 
+{
+	struct client_state *client_state = data;
+	assert(format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1);
+
+	char *map_shm = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+	assert(map_shm != MAP_FAILED);
+
+	struct xkb_keymap *xkb_keymap = xkb_keymap_new_from_string(
+			client_state->xkb_context, map_shm,
+			XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	munmap(map_shm, size);
+	close(fd);
+
+	struct xkb_state *xkb_state = xkb_state_new(xkb_keymap);
+	xkb_keymap_unref(client_state->xkb_keymap);
+	xkb_state_unref(client_state->xkb_state);
+	client_state->xkb_keymap = xkb_keymap;
+	client_state->xkb_state = xkb_state;
+}
+
+static void
+wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
+		  uint32_t serial, struct wl_surface *surface,
+		  struct wl_array *keys)
+{
+	struct client_state *client_state = data;
+	fprintf(stderr, "keyboard enter; keys pressed are:\n");
+	uint32_t *key;
+	wl_array_for_each(key, keys) {
+		char buf[128];
+		xkb_keysym_t sym = xkb_state_key_get_one_sym(
+				client_state->xkb_state, *key + 8);
+		xkb_keysym_get_name(sym, buf, sizeof(buf));
+		fprintf(stderr, "sym: %-12s (%d), ", buf, sym);
+		xkb_state_key_get_utf8(client_state->xkb_state,
+				*key + 8, buf, sizeof(buf));
+		fprintf(stderr, "utf8: '%s'\n", buf);
+	}
+}
+
+static void
+wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
+		uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
+{
+	struct client_state *client_state = data;
+	char buf[128];
+	uint32_t keycode = key + 8;
+	xkb_keysym_t sym = xkb_state_key_get_one_sym(
+			client_state->xkb_state, keycode);
+	xkb_keysym_get_name(sym, buf, sizeof(buf));
+	const char *action = 
+		state == WL_KEYBOARD_KEY_STATE_PRESSED ? "press" : "release";
+	fprintf(stderr, "key %s: sym: %-12s (%d), ", action, buf, sym);
+	xkb_state_key_get_utf8(client_state->xkb_state, keycode,
+			buf, sizeof(buf));
+	fprintf(stderr, "utf8: '%s'\n", buf);
+}
+
+static void
+wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
+		  uint32_t serial, struct wl_surface *surface)
+{
+	fprintf(stderr, "keyboard leave\n");
+}
+
+static void
+wl_keyboard_modifiers(void *data, struct wl_keyboard *wl_keyboard,
+		      uint32_t serial, uint32_t mods_depressed,
+		      uint32_t mods_latched, uint32_t mods_locked,
+		      uint32_t group)
+{
+	struct client_state *client_state = data;
+	xkb_state_update_mask(client_state->xkb_state,
+		       mods_depressed, mods_latched, mods_locked, 0, 0, group);
+}
+
+static void
+wl_keyboard_repeat_info(void *data, struct wl_keyboard *wl_keyboard,
+			int32_t rate, int32_t delay)
+{
+}
+
+static const struct wl_keyboard_listener wl_keyboard_listener = {
+	.keymap = wl_keyboard_keymap,
+	.enter = wl_keyboard_enter,
+	.leave = wl_keyboard_leave,
+	.key = wl_keyboard_key,
+	.modifiers = wl_keyboard_modifiers,
+	.repeat_info = wl_keyboard_repeat_info,
+};
+
+static void
 wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities)
 {
 	struct client_state *state = data;
-	/* TODO */
 
 	bool have_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
 
@@ -363,6 +461,17 @@ wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities)
 	} else if (!have_pointer && state->wl_pointer != NULL) {
 		wl_pointer_release(state->wl_pointer);
 		state->wl_pointer = NULL;
+	}
+
+	bool have_keyboard = capabilities & WL_SEAT_CAPABILITY_KEYBOARD;
+
+	if (have_keyboard && state->wl_keyboard == NULL) {
+		state->wl_keyboard = wl_seat_get_keyboard(state->wl_seat);
+		wl_keyboard_add_listener(state->wl_keyboard,
+				&wl_keyboard_listener, state);
+	} else if (!have_keyboard && state->wl_keyboard != NULL) {
+		wl_keyboard_release(state->wl_keyboard);
+		state->wl_keyboard = NULL;
 	}
 }
 
@@ -450,6 +559,7 @@ main(int argc, char *argv[])
 	struct client_state state = { 0 };
 	state.wl_display = wl_display_connect(NULL);
 	state.wl_registry = wl_display_get_registry(state.wl_display);
+	state.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	wl_registry_add_listener(state.wl_registry, &wl_registry_listener, &state);
 	wl_display_roundtrip(state.wl_display);
 
