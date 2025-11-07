@@ -1,5 +1,9 @@
 ```sh
-cc -o ./build/client client.c xdg-shell-protocol.c -lwayland-client -lrt
+curl -O https://cgit.freedesktop.org/wayland/wayland-protocols/plain/stable/xdg-shell/xdg-shell.xml
+wayland-scanner private-code < xdg-shell.xml > xdg-shell-protocol.c
+wayland-scanner client-header < xdg-shell.xml > xdg-shell-client-protocol.h
+mkdir build
+clang -o ./build/client client.c xdg-shell-protocol.c -lwayland-client -lrt -fuse-ld=lld -lxkbcommon
 ```
 
 ## Glossary
